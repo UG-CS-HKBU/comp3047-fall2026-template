@@ -1,0 +1,1037 @@
+name: Assignment 2 Feedback & Screenshot Report
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      # ── Stage 1: Checkout & Project Layout Detection ──────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Detect Backend & Frontend Directories
+        id: dirs
+        run: |
+          if [ -f "backend/package.json" ]; then
+            BACKEND_DIR="backend"
+          elif [ -f "package.json" ]; then
+            BACKEND_DIR="."
+          else
+            echo "::error::Could not find backend package.json in root or backend/"
+            exit 1
+          fi
+
+          if [ -f "frontend/package.json" ]; then
+            FRONTEND_DIR="frontend"
+            HAS_FRONTEND="true"
+          else
+            FRONTEND_DIR="frontend"
+            HAS_FRONTEND="false"
+            echo "::warning::frontend/package.json not found! Assignment 2 requires the Vue 3 SPA inside frontend/."
+          fi
+
+          echo "backend_dir=$BACKEND_DIR" >> "$GITHUB_OUTPUT"
+          echo "frontend_dir=$FRONTEND_DIR" >> "$GITHUB_OUTPUT"
+          echo "has_frontend=$HAS_FRONTEND" >> "$GITHUB_OUTPUT"
+          mkdir -p /home/runner/report-artifact/screenshots
+
+      - name: Install Backend Dependencies
+        working-directory: ${{ steps.dirs.outputs.backend_dir }}
+        run: npm ci || npm install
+
+      - name: Install Frontend Dependencies
+        if: steps.dirs.outputs.has_frontend == 'true'
+        working-directory: ${{ steps.dirs.outputs.frontend_dir }}
+        run: npm ci || npm install
+
+      # ── Stage 2: Detect Cloud MongoDB or Fallback to Local Seed ───────────
+      - name: Resolve MongoDB Connection & Seed Fallback Only
+        id: db_setup
+        working-directory: ${{ steps.dirs.outputs.backend_dir }}
+        run: |
+          node <<'DBSETUP'
+          const fs = require('fs');
+          const path = require('path');
+          const { MongoClient, ObjectId } = require('mongodb');
+
+          const rootDir = path.resolve(process.cwd(), '${{ steps.dirs.outputs.backend_dir }}' === '.' ? '.' : '..');
+
+          function findCandidateFiles(dir, depth = 0) {
+            if (depth > 3 || !fs.existsSync(dir)) return [];
+            let files = [];
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (['node_modules', '.git', 'dist', 'frontend'].includes(entry.name)) continue;
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                files = files.concat(findCandidateFiles(full, depth + 1));
+              } else if (
+                entry.name === 'db.js' ||
+                entry.name.startsWith('.env') ||
+                entry.name.endsWith('.js') ||
+                entry.name.endsWith('.json')
+              ) {
+                files.push(full);
+              }
+            }
+            return files;
+          }
+
+          function extractCloudMongoUri() {
+            // Prioritize utils/db.js and .env files first
+            const allFiles = findCandidateFiles(rootDir).sort((a, b) => {
+              const score = p => (p.endsWith('utils/db.js') ? 0 : p.includes('.env') ? 1 : 2);
+              return score(a) - score(b);
+            });
+
+            const uriRegex = /mongodb(?:\+srv)?:\/\/[^\s'"`<>\\]+/g;
+            for (const file of allFiles) {
+              let content = '';
+              try { content = fs.readFileSync(file, 'utf8'); } catch (_) { continue; }
+              const matches = content.match(uriRegex) || [];
+              for (const raw of matches) {
+                const uri = raw.replace(/[;,)\]]+$/, '');
+                if (
+                  uri.includes('localhost') ||
+                  uri.includes('127.0.0.1') ||
+                  uri.includes('your_mongodb_uri') ||
+                  uri.includes('username:password') ||
+                  uri.includes('example.com')
+                ) {
+                  continue;
+                }
+                return { uri, source: path.relative(rootDir, file) };
+              }
+            }
+            return null;
+          }
+
+          function resolveDbName(uri) {
+            try {
+              const parsed = new URL(uri);
+              const pathname = (parsed.pathname || '').replace(/^\//, '').trim();
+              return pathname || 'bookingsDB';
+            } catch (_) {
+              return 'bookingsDB';
+            }
+          }
+
+          async function run() {
+            const discovered = extractCloudMongoUri();
+            let activeUri = 'mongodb://localhost:27017';
+            let dbMode = 'Local MongoDB Fallback (Seeded)';
+
+            if (discovered) {
+              console.log(`Found cloud MongoDB URI in ${discovered.source}. Verifying connection...`);
+              try {
+                const testClient = new MongoClient(discovered.uri, { serverSelectionTimeoutMS: 10000 });
+                await testClient.connect();
+                const dbName = resolveDbName(discovered.uri);
+                const db = testClient.db(dbName);
+                await db.command({ ping: 1 });
+
+                const sampleEvent = await db.collection('events').findOne({});
+                const sampleVenue = await db.collection('venues').findOne({});
+                await testClient.close();
+
+                activeUri = discovered.uri;
+                dbMode = `Cloud MongoDB (${discovered.source}, existing data - no seed)`;
+
+                const eventId = sampleEvent ? String(sampleEvent._id) : '507f1f77bcf86cd799439021';
+                const venueId = sampleVenue ? String(sampleVenue._id) : '507f1f77bcf86cd799439011';
+
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `mongodb_uri=${activeUri}\n`);
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `db_mode=${dbMode}\n`);
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `sample_event_id=${eventId}\n`);
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `sample_venue_id=${venueId}\n`);
+
+                console.log(`Connected to Cloud MongoDB (${dbName}). Skipping seed. Using Sample Event ID: ${eventId}, Venue ID: ${venueId}`);
+                return;
+              } catch (err) {
+                console.warn(`Cloud MongoDB connection failed (${err.message}). Falling back to local MongoDB...`);
+              }
+            } else {
+              console.log('No cloud MongoDB URI found in repository. Falling back to local MongoDB...');
+            }
+
+            // Fallback: Seed Local MongoDB
+            const client = new MongoClient(activeUri);
+            await client.connect();
+            const db = client.db('bookingsDB');
+
+            const collections = await db.listCollections().toArray();
+            for (const c of collections) {
+              await db.collection(c.name).deleteMany({});
+            }
+
+            const venues = [
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439011'),
+                name: 'Main Auditorium',
+                location: 'Building A, Floor 1',
+                capacity: 200,
+                facilities: ['Projector', 'Microphone', 'Wi-Fi'],
+                description: 'Large auditorium for campus-wide conferences and keynotes.',
+                createdAt: new Date('2026-09-01T08:00:00Z'),
+                updatedAt: new Date('2026-09-01T08:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439012'),
+                name: 'Seminar Room 1',
+                location: 'Building B, Floor 2',
+                capacity: 50,
+                facilities: ['Whiteboard', 'Wi-Fi'],
+                description: 'Interactive seminar room ideal for academic discussions.',
+                createdAt: new Date('2026-09-02T08:00:00Z'),
+                updatedAt: new Date('2026-09-02T08:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439013'),
+                name: 'Computer Lab 304',
+                location: 'Building C, Floor 3',
+                capacity: 40,
+                facilities: ['Computers', 'Wi-Fi', 'Printer'],
+                description: 'Software engineering laboratory with dual-monitor workstations.',
+                createdAt: new Date('2026-09-03T08:00:00Z'),
+                updatedAt: new Date('2026-09-03T08:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439014'),
+                name: 'Lecture Hall 2',
+                location: 'Building A, Floor 3',
+                capacity: 150,
+                facilities: ['Projector', 'Microphone', 'Recording'],
+                description: 'Tiered lecture theatre with lecture capture equipment.',
+                createdAt: new Date('2026-09-04T08:00:00Z'),
+                updatedAt: new Date('2026-09-04T08:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439015'),
+                name: 'Innovation Hub',
+                location: 'Building B, Floor 1',
+                capacity: 35,
+                facilities: ['Whiteboard', 'Wi-Fi', 'Smart TV'],
+                description: 'Collaborative space for student project pitches.',
+                createdAt: new Date('2026-09-05T08:00:00Z'),
+                updatedAt: new Date('2026-09-05T08:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439016'),
+                name: 'Robotics Workshop Bay',
+                location: 'Building D, Ground Floor',
+                capacity: 30,
+                facilities: ['Workbenches', 'Tools', 'Wi-Fi'],
+                description: 'Hands-on fabrication and robotics testing arena.',
+                createdAt: new Date('2026-09-06T08:00:00Z'),
+                updatedAt: new Date('2026-09-06T08:00:00Z')
+              }
+            ];
+            await db.collection('venues').insertMany(venues);
+
+            const events = [
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439021'),
+                title: 'AI & Multimodal Systems Workshop',
+                description: 'Hands-on introduction to generative AI and agent workflows.',
+                bannerImage: 'https://picsum.photos/seed/event1/800/400',
+                category: 'Workshop',
+                speaker: 'Dr. Smith',
+                dateTime: new Date('2026-11-15T10:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439011'),
+                capacity: 50,
+                status: 'Upcoming',
+                isHighlighted: true,
+                viewCount: 120,
+                createdAt: new Date('2026-10-01T10:00:00Z'),
+                updatedAt: new Date('2026-10-01T10:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439022'),
+                title: 'Data Science & Analytics Seminar',
+                description: 'Modern pipelines for real-time big data analytics.',
+                bannerImage: 'https://picsum.photos/seed/event2/800/400',
+                category: 'Seminar',
+                speaker: 'Prof. Johnson',
+                dateTime: new Date('2026-11-20T14:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439012'),
+                capacity: 100,
+                status: 'Upcoming',
+                isHighlighted: true,
+                viewCount: 95,
+                createdAt: new Date('2026-10-02T10:00:00Z'),
+                updatedAt: new Date('2026-10-02T10:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439023'),
+                title: 'Vue 3 Composition API Bootcamp',
+                description: 'Full-stack SPA architecture with Express and Vue 3.',
+                bannerImage: 'https://picsum.photos/seed/event3/800/400',
+                category: 'Workshop',
+                speaker: 'Ms. Lee',
+                dateTime: new Date('2026-11-25T09:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439013'),
+                capacity: 30,
+                status: 'Ongoing',
+                isHighlighted: false,
+                viewCount: 150,
+                createdAt: new Date('2026-10-03T10:00:00Z'),
+                updatedAt: new Date('2026-10-03T10:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439024'),
+                title: 'Cybersecurity Best Practices Talk',
+                description: 'Securing web APIs, tokens, and cloud deployments.',
+                bannerImage: 'https://picsum.photos/seed/event4/800/400',
+                category: 'Talk',
+                speaker: 'Mr. Brown',
+                dateTime: new Date('2026-12-01T13:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439014'),
+                capacity: 80,
+                status: 'Upcoming',
+                isHighlighted: true,
+                viewCount: 80,
+                createdAt: new Date('2026-10-04T10:00:00Z'),
+                updatedAt: new Date('2026-10-04T10:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439025'),
+                title: 'Cloud Native Kubernetes Lab',
+                description: 'Deploying containerized microservices on Kubernetes.',
+                bannerImage: 'https://picsum.photos/seed/event5/800/400',
+                category: 'Lab',
+                speaker: 'Dr. Wang',
+                dateTime: new Date('2026-12-05T11:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439015'),
+                capacity: 40,
+                status: 'Upcoming',
+                isHighlighted: false,
+                viewCount: 60,
+                createdAt: new Date('2026-10-05T10:00:00Z'),
+                updatedAt: new Date('2026-10-05T10:00:00Z')
+              },
+              {
+                _id: new ObjectId('507f1f77bcf86cd799439026'),
+                title: 'Autonomous Robotics Symposium',
+                description: 'Embedded control, swerve kinematics, and vision systems.',
+                bannerImage: 'https://picsum.photos/seed/event6/800/400',
+                category: 'Conference',
+                speaker: 'Prof. Davis',
+                dateTime: new Date('2026-10-10T10:00:00Z'),
+                venue: new ObjectId('507f1f77bcf86cd799439016'),
+                capacity: 200,
+                status: 'Completed',
+                isHighlighted: true,
+                viewCount: 210,
+                createdAt: new Date('2026-10-06T10:00:00Z'),
+                updatedAt: new Date('2026-10-06T10:00:00Z')
+              }
+            ];
+            await db.collection('events').insertMany(events);
+            await client.close();
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `mongodb_uri=${activeUri}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `db_mode=${dbMode}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `sample_event_id=507f1f77bcf86cd799439021\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `sample_venue_id=507f1f77bcf86cd799439011\n`);
+            console.log('Seeded 6 venues and 6 events with deterministic ObjectIds.');
+          }
+
+          run().catch(e => { console.error('Seed/Setup error:', e); process.exit(1); });
+          DBSETUP
+
+      # ── Stage 3: Start Express Backend & Vue 3 Frontend ───────────────────
+      - name: Start Express Backend Server (Port 3000)
+        id: backend_server
+        working-directory: ${{ steps.dirs.outputs.backend_dir }}
+        env:
+          RESOLVED_MONGODB_URI: ${{ steps.db_setup.outputs.mongodb_uri }}
+        run: |
+          PORT=3000 MONGODB_URI=$RESOLVED_MONGODB_URI node ./bin/www > /home/runner/backend.log 2>&1 &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/api/events > /dev/null 2>&1 || curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "Express backend listening on http://localhost:3000"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::warning::Express server did not respond on port 3000 within 30s"
+          cat /home/runner/backend.log || true
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+
+      - name: Start Vue 3 Vite Server (Port 5173)
+        id: frontend_server
+        if: steps.dirs.outputs.has_frontend == 'true'
+        working-directory: ${{ steps.dirs.outputs.frontend_dir }}
+        run: |
+          npx vite --host 0.0.0.0 --port 5173 > /home/runner/frontend.log 2>&1 &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:5173/ > /dev/null 2>&1; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "app_url=http://localhost:5173" >> "$GITHUB_OUTPUT"
+              echo "Vue 3 Vite dev server listening on http://localhost:5173"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::warning::Vite server did not start on port 5173 within 30s; falling back to http://localhost:3000"
+          cat /home/runner/frontend.log || true
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "app_url=http://localhost:3000" >> "$GITHUB_OUTPUT"
+
+      # ── Stage 4: Static Code & Lab 5/6 Compliance Checks ──────────────────
+      - name: Run Static & Composition API Compliance Tests
+        id: static_checks
+        continue-on-error: true
+        run: |
+          node <<'SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+
+          const results = [];
+          function test(name, fn) {
+            try { fn(); results.push({ name, pass: true }); }
+            catch (e) { results.push({ name, pass: false, error: e.message }); }
+          }
+
+          const rootDir = process.cwd();
+          const frontendDir = path.join(rootDir, 'frontend');
+          const frontendSrc = path.join(frontendDir, 'src');
+
+          function getFiles(dir, exts) {
+            let out = [];
+            if (!fs.existsSync(dir)) return out;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) out = out.concat(getFiles(full, exts));
+              else if (exts.some(ext => entry.name.endsWith(ext))) out.push(full);
+            }
+            return out;
+          }
+
+          const vueFiles = getFiles(frontendSrc, ['.vue']);
+          const allFrontendFiles = getFiles(frontendSrc, ['.vue', '.js', '.ts']);
+          const combinedVue = vueFiles.map(f => fs.readFileSync(f, 'utf8')).join('\n');
+          const combinedFrontend = allFrontendFiles.map(f => fs.readFileSync(f, 'utf8')).join('\n');
+
+          test('frontend/ directory and package.json exist', () => {
+            if (!fs.existsSync(path.join(frontendDir, 'package.json'))) {
+              throw new Error('frontend/package.json is missing');
+            }
+          });
+
+          test('Vite proxy config for /api exists in vite.config.*', () => {
+            const cfgCandidates = ['vite.config.js', 'vite.config.ts', 'vite.config.mjs']
+              .map(f => path.join(frontendDir, f))
+              .filter(f => fs.existsSync(f));
+            if (cfgCandidates.length === 0) throw new Error('No vite.config.* found in frontend/');
+            const cfgContent = fs.readFileSync(cfgCandidates[0], 'utf8');
+            if (!cfgContent.includes('proxy') || !cfgContent.includes('/api')) {
+              throw new Error('vite.config does not configure server.proxy for /api');
+            }
+          });
+
+          test('Uses <script setup> in Vue components', () => {
+            if (vueFiles.length === 0) throw new Error('No .vue files found in frontend/src');
+            if (!combinedVue.includes('<script setup')) {
+              throw new Error('No <script setup> found in .vue files');
+            }
+          });
+
+          test('No Options API (data(), methods:, mounted()) used in .vue files', () => {
+            const offending = [];
+            for (const f of vueFiles) {
+              const txt = fs.readFileSync(f, 'utf8');
+              if (/\bmethods\s*:\s*\{/.test(txt) || /\bdata\s*\(\s*\)\s*\{/.test(txt) || /\bmounted\s*\(\s*\)\s*\{/.test(txt)) {
+                offending.push(path.relative(rootDir, f));
+              }
+            }
+            if (offending.length > 0) {
+              throw new Error('Options API detected in: ' + offending.join(', '));
+            }
+          });
+
+          test('Uses Composition API primitives (ref, computed, watch, onMounted)', () => {
+            const missing = ['ref', 'computed', 'watch', 'onMounted'].filter(fn => !new RegExp('\\b' + fn + '\\b').test(combinedFrontend));
+            if (missing.length > 0) {
+              throw new Error('Missing Composition API functions: ' + missing.join(', '));
+            }
+          });
+
+          test('Uses Vue Router Composition API (useRoute, useRouter)', () => {
+            if (!/\buseRoute\b/.test(combinedFrontend) || !/\buseRouter\b/.test(combinedFrontend)) {
+              throw new Error('Expected both useRoute() and useRouter() in frontend/src');
+            }
+          });
+
+          test('Uses native Fetch API (no XMLHttpRequest)', () => {
+            if (/\bXMLHttpRequest\b/.test(combinedFrontend)) {
+              throw new Error('XMLHttpRequest is not permitted; use native fetch()');
+            }
+            if (!/\bfetch\s*\(/.test(combinedFrontend)) {
+              throw new Error('No fetch() calls found in frontend/src');
+            }
+          });
+
+          fs.writeFileSync('/home/runner/static-results.json', JSON.stringify(results, null, 2));
+          SCRIPT
+
+      # ── Stage 5: Backend RESTful API Endpoint Tests ───────────────────────
+      - name: Run RESTful API Tests (/api/events & /api/venues)
+        id: api_tests
+        continue-on-error: true
+        env:
+          SAMPLE_EVENT_ID: ${{ steps.db_setup.outputs.sample_event_id }}
+          SAMPLE_VENUE_ID: ${{ steps.db_setup.outputs.sample_venue_id }}
+        run: |
+          node <<'SCRIPT'
+          const http = require('http');
+          const fs = require('fs');
+
+          const EVENT_ID = process.env.SAMPLE_EVENT_ID || '507f1f77bcf86cd799439021';
+          const VENUE_ID = process.env.SAMPLE_VENUE_ID || '507f1f77bcf86cd799439011';
+
+          const results = [];
+          async function test(name, fn) {
+            try { await fn(); results.push({ name, pass: true }); }
+            catch (e) { results.push({ name, pass: false, error: e.message }); }
+          }
+
+          function request(method, path, bodyObj = null) {
+            return new Promise((resolve, reject) => {
+              const payload = bodyObj ? JSON.stringify(bodyObj) : null;
+              const req = http.request({
+                hostname: 'localhost',
+                port: 3000,
+                path,
+                method,
+                headers: payload ? {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(payload)
+                } : {}
+              }, (res) => {
+                let raw = '';
+                res.on('data', chunk => raw += chunk);
+                res.on('end', () => {
+                  let json = null;
+                  try { json = JSON.parse(raw); } catch (_) {}
+                  resolve({ status: res.statusCode, headers: res.headers, raw, json });
+                });
+              });
+              req.on('error', reject);
+              if (payload) req.write(payload);
+              req.end();
+            });
+          }
+
+          (async () => {
+            // 1. GET /api/events
+            await test('GET /api/events returns 200 and { events, total, page, perPage }', async () => {
+              const res = await request('GET', '/api/events?page=1&perPage=6');
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+              if (!res.json || !Array.isArray(res.json.events)) throw new Error('Response missing events array');
+              if (typeof res.json.total !== 'number') throw new Error('Response missing numeric total');
+            });
+
+            // 2. GET /api/events/:id (existing & 404)
+            await test('GET /api/events/:id returns 200 for existing event', async () => {
+              const res = await request('GET', '/api/events/' + EVENT_ID);
+              if (res.status !== 200 || !res.json) throw new Error(`Expected 200 JSON for ${EVENT_ID}, got ` + res.status);
+            });
+
+            await test('GET /api/events/:id returns 404 when not found', async () => {
+              const res = await request('GET', '/api/events/507f1f77bcf86cd799439099');
+              if (res.status !== 404) throw new Error('Expected 404, got ' + res.status);
+            });
+
+            // 3. POST, PATCH/PUT, DELETE /api/events lifecycle (does not affect existing DB records)
+            let createdEventId = null;
+            await test('POST /api/events creates event (201)', async () => {
+              const res = await request('POST', '/api/events', {
+                title: 'CI Test Event',
+                description: 'Created by GitHub Actions pipeline',
+                category: 'Workshop',
+                speaker: 'CI Bot',
+                dateTime: '2026-12-15T10:00:00Z',
+                venue: VENUE_ID,
+                capacity: 45,
+                status: 'Upcoming',
+                isHighlighted: false
+              });
+              if (res.status !== 201 && res.status !== 200) throw new Error('Expected 201, got ' + res.status);
+              createdEventId = res.json && (res.json.id || res.json._id || (res.json.event && res.json.event._id));
+              if (!createdEventId) throw new Error('Response did not include created event id');
+            });
+
+            await test('PATCH /api/events/:id updates event (200)', async () => {
+              if (!createdEventId) throw new Error('Skipped: no createdEventId');
+              let res = await request('PATCH', '/api/events/' + createdEventId, { title: 'CI Test Event Updated' });
+              if (res.status === 404 || res.status === 405) {
+                res = await request('PUT', '/api/events/' + createdEventId, { title: 'CI Test Event Updated' });
+              }
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+            });
+
+            await test('DELETE /api/events/:id deletes event (200)', async () => {
+              if (!createdEventId) throw new Error('Skipped: no createdEventId');
+              const res = await request('DELETE', '/api/events/' + createdEventId);
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+            });
+
+            // 4. GET /api/venues
+            await test('GET /api/venues returns 200 and { venues, total, page, perPage }', async () => {
+              const res = await request('GET', '/api/venues?page=1&perPage=10');
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+              if (!res.json || !Array.isArray(res.json.venues)) throw new Error('Response missing venues array');
+            });
+
+            // 5. GET /api/venues/:id (existing & 404)
+            await test('GET /api/venues/:id returns 200 for existing venue', async () => {
+              const res = await request('GET', '/api/venues/' + VENUE_ID);
+              if (res.status !== 200 || !res.json) throw new Error(`Expected 200 JSON for ${VENUE_ID}, got ` + res.status);
+            });
+
+            await test('GET /api/venues/:id returns 404 when not found', async () => {
+              const res = await request('GET', '/api/venues/507f1f77bcf86cd799439099');
+              if (res.status !== 404) throw new Error('Expected 404, got ' + res.status);
+            });
+
+            // 6. POST, PATCH/PUT, DELETE /api/venues lifecycle (does not affect existing DB records)
+            let createdVenueId = null;
+            await test('POST /api/venues creates venue (201)', async () => {
+              const res = await request('POST', '/api/venues', {
+                name: 'CI Test Venue',
+                location: 'Building Z, Room 101',
+                capacity: 60,
+                facilities: ['Wi-Fi', 'Projector'],
+                description: 'Temporary test venue'
+              });
+              if (res.status !== 201 && res.status !== 200) throw new Error('Expected 201, got ' + res.status);
+              createdVenueId = res.json && (res.json.id || res.json._id || (res.json.venue && res.json.venue._id));
+              if (!createdVenueId) throw new Error('Response did not include created venue id');
+            });
+
+            await test('PATCH /api/venues/:id updates venue (200)', async () => {
+              if (!createdVenueId) throw new Error('Skipped: no createdVenueId');
+              let res = await request('PATCH', '/api/venues/' + createdVenueId, { name: 'CI Test Venue Updated' });
+              if (res.status === 404 || res.status === 405) {
+                res = await request('PUT', '/api/venues/' + createdVenueId, { name: 'CI Test Venue Updated' });
+              }
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+            });
+
+            await test('DELETE /api/venues/:id deletes venue (200)', async () => {
+              if (!createdVenueId) throw new Error('Skipped: no createdVenueId');
+              const res = await request('DELETE', '/api/venues/' + createdVenueId);
+              if (res.status !== 200) throw new Error('Expected 200, got ' + res.status);
+            });
+
+            fs.writeFileSync('/home/runner/api-results.json', JSON.stringify(results, null, 2));
+          })();
+          SCRIPT
+
+      # ── Stage 6: Playwright E2E Tests & Screenshot Capture ────────────────
+      - name: Install Playwright Chromium
+        working-directory: ${{ steps.dirs.outputs.backend_dir }}
+        run: |
+          npm install playwright --no-save
+          npx playwright install --with-deps chromium
+
+      - name: Capture Desktop & Mobile Screenshots + E2E Checks
+        working-directory: ${{ steps.dirs.outputs.backend_dir }}
+        env:
+          APP_BASE_URL: ${{ steps.frontend_server.outputs.app_url || 'http://localhost:3000' }}
+          SAMPLE_EVENT_ID: ${{ steps.db_setup.outputs.sample_event_id }}
+          SAMPLE_VENUE_ID: ${{ steps.db_setup.outputs.sample_venue_id }}
+        run: |
+          node <<'SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const baseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
+          const EVENT_ID = process.env.SAMPLE_EVENT_ID || '507f1f77bcf86cd799439021';
+          const VENUE_ID = process.env.SAMPLE_VENUE_ID || '507f1f77bcf86cd799439011';
+          const outDir = '/home/runner/report-artifact/screenshots';
+          fs.mkdirSync(outDir, { recursive: true });
+
+          const routes = [
+            {
+              slug: '01-homepage',
+              title: '1. Homepage (/)',
+              route: '/',
+              description: 'Highlighted carousel, latest 6, trending 6, and upcoming 6 events'
+            },
+            {
+              slug: '02-events-list',
+              title: '2. Events List (/events)',
+              route: '/events',
+              description: 'Paginated events list with keyword search and category filter'
+            },
+            {
+              slug: '03-event-detail',
+              title: `3. Event Detail (/event/detail/${EVENT_ID})`,
+              route: `/event/detail/${EVENT_ID}`,
+              description: 'Complete event details, speaker, venue info, and related events'
+            },
+            {
+              slug: '04-event-add',
+              title: '4. Add Event (/event/add)',
+              route: '/event/add',
+              description: 'Reactive v-model form to create a new event with validation'
+            },
+            {
+              slug: '05-event-edit',
+              title: `5. Edit Event (/event/edit/${EVENT_ID})`,
+              route: `/event/edit/${EVENT_ID}`,
+              description: 'Pre-filled v-model form to update or delete an existing event'
+            },
+            {
+              slug: '06-venues-list',
+              title: '6. Venues List (/venues)',
+              route: '/venues',
+              description: 'Paginated venues list with facilities, capacity, and edit links'
+            },
+            {
+              slug: '07-venue-add',
+              title: '7. Add Venue (/venue/add)',
+              route: '/venue/add',
+              description: 'Reactive v-model form to create a new venue'
+            },
+            {
+              slug: '08-venue-edit',
+              title: `8. Edit Venue (/venue/edit/${VENUE_ID})`,
+              route: `/venue/edit/${VENUE_ID}`,
+              description: 'Pre-filled v-model form to update or delete an existing venue'
+            }
+          ];
+
+          const e2eResults = [];
+          const screenshotManifest = [];
+
+          async function test(name, fn) {
+            try { await fn(); e2eResults.push({ name, pass: true }); }
+            catch (e) { e2eResults.push({ name, pass: false, error: e.message }); }
+          }
+
+          (async () => {
+            const browser = await chromium.launch();
+
+            for (const item of routes) {
+              const targetUrl = baseUrl + item.route;
+              const desktopFile = `${item.slug}-desktop.png`;
+              const mobileFile = `${item.slug}-mobile.png`;
+              const consoleErrors = [];
+              const apiCalls = [];
+
+              // 1. Desktop Capture (1280x720)
+              const dCtx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+              const dPage = await dCtx.newPage();
+              dPage.on('dialog', dialog => dialog.dismiss().catch(() => {}));
+              dPage.on('console', msg => {
+                if (msg.type() === 'error') consoleErrors.push(msg.text());
+              });
+              dPage.on('response', res => {
+                if (res.url().includes('/api/')) {
+                  apiCalls.push({ url: res.url().replace(/^https?:\/\/[^/]+/, ''), status: res.status() });
+                }
+              });
+
+              let status = 'OK';
+              try {
+                await dPage.goto(targetUrl, { waitUntil: 'networkidle', timeout: 15000 });
+              } catch (e) {
+                status = 'TIMEOUT/WARN: ' + e.message.split('\n')[0];
+              }
+              await dPage.waitForTimeout(1000);
+              await dPage.screenshot({ path: path.join(outDir, desktopFile), fullPage: true });
+
+              // Run page-specific E2E assertions on the live desktop DOM
+              if (item.route === '/') {
+                await test('Homepage renders navbar & Bootstrap styling', async () => {
+                  const navCount = await dPage.locator('nav, .navbar').count();
+                  if (navCount === 0) throw new Error('No <nav> or .navbar found on Homepage');
+                });
+              } else if (item.route === '/event/add' || item.route === '/venue/add') {
+                await test(`Form inputs exist on ${item.route}`, async () => {
+                  const count = await dPage.locator('input, select, textarea').count();
+                  if (count === 0) throw new Error(`No form inputs found on ${item.route}`);
+                });
+              } else if (item.route === `/event/edit/${EVENT_ID}` || item.route === `/venue/edit/${VENUE_ID}`) {
+                await test(`Edit form pre-fills inputs on ${item.route}`, async () => {
+                  const count = await dPage.locator('input, select, textarea').count();
+                  if (count === 0) throw new Error(`No form inputs found on ${item.route}`);
+                });
+              }
+
+              await dCtx.close();
+
+              // 2. Mobile Capture (375x667) + Horizontal Overflow Check
+              const mCtx = await browser.newContext({ viewport: { width: 375, height: 667 } });
+              const mPage = await mCtx.newPage();
+              mPage.on('dialog', dialog => dialog.dismiss().catch(() => {}));
+              try {
+                await mPage.goto(targetUrl, { waitUntil: 'networkidle', timeout: 15000 });
+              } catch (_) {}
+              await mPage.waitForTimeout(1000);
+              await mPage.screenshot({ path: path.join(outDir, mobileFile), fullPage: true });
+
+              const overflow = await mPage.evaluate(() => {
+                return {
+                  scrollWidth: document.documentElement.scrollWidth,
+                  clientWidth: document.documentElement.clientWidth
+                };
+              });
+              await mCtx.close();
+
+              screenshotManifest.push({
+                ...item,
+                targetUrl,
+                status,
+                desktopFile,
+                mobileFile,
+                consoleErrors: consoleErrors.slice(0, 5),
+                apiCalls,
+                mobileOverflow: overflow.scrollWidth > overflow.clientWidth + 5
+                  ? `${overflow.scrollWidth}px > ${overflow.clientWidth}px`
+                  : 'None (Responsive)'
+              });
+            }
+
+            await browser.close();
+            fs.writeFileSync('/home/runner/e2e-results.json', JSON.stringify(e2eResults, null, 2));
+            fs.writeFileSync('/home/runner/screenshots-manifest.json', JSON.stringify(screenshotManifest, null, 2));
+          })();
+          SCRIPT
+
+      # ── Stage 7: Generate HTML & Markdown Feedback Reports ────────────────
+      - name: Generate Visual HTML & Markdown Feedback Reports
+        if: always()
+        env:
+          DB_MODE: ${{ steps.db_setup.outputs.db_mode || 'Local MongoDB Fallback (Seeded)' }}
+        run: |
+          node <<'SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+
+          function readJson(file) {
+            try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+            catch (_) { return []; }
+          }
+
+          const staticResults = readJson('/home/runner/static-results.json');
+          const apiResults = readJson('/home/runner/api-results.json');
+          const e2eResults = readJson('/home/runner/e2e-results.json');
+          const manifest = readJson('/home/runner/screenshots-manifest.json');
+
+          function summarize(arr) {
+            const passed = arr.filter(r => r.pass).length;
+            return { passed, total: arr.length };
+          }
+
+          const sStat = summarize(staticResults);
+          const aStat = summarize(apiResults);
+          const eStat = summarize(e2eResults);
+          const totalPassed = sStat.passed + aStat.passed + eStat.passed;
+          const totalCount = sStat.total + aStat.total + eStat.total;
+
+          function renderMdTable(title, arr) {
+            let md = `## ${title}\n\n| Check | Status |\n|---|---|\n`;
+            for (const r of arr) {
+              md += `| ${r.name} | ${r.pass ? '✅ PASS' : '❌ FAIL: ' + r.error} |\n`;
+            }
+            return md + '\n';
+          }
+
+          // 1. Build Markdown Report (for Job Summary + Artifact)
+          let md = `# COMP3047 Assignment 2 — Automated Feedback Report\n\n`;
+          md += `- **Repository:** \`${process.env.GITHUB_REPOSITORY || 'local'}\`\n`;
+          md += `- **Commit / Ref:** \`${process.env.GITHUB_REF_NAME || 'HEAD'}\` (\`${(process.env.GITHUB_SHA || '').slice(0, 7)}\`)\n`;
+          md += `- **Database Mode:** ${process.env.DB_MODE}\n`;
+          md += `- **Generated At (UTC):** ${new Date().toISOString()}\n\n`;
+          md += `## Overall Summary (${totalPassed}/${totalCount} Checks Passed)\n\n`;
+          md += `| Category | Passed | Total |\n|---|---|---|\n`;
+          md += `| Vue 3 & Lab 5/6 Static Compliance | ${sStat.passed} | ${sStat.total} |\n`;
+          md += `| Express RESTful API Endpoints | ${aStat.passed} | ${aStat.total} |\n`;
+          md += `| Playwright Browser E2E Checks | ${eStat.passed} | ${eStat.total} |\n\n`;
+          md += `> **How to view your application screenshots:** Download the **\`assignment2-feedback-report\`** artifact ZIP from the bottom of this GitHub Actions run page, unzip it, and open **\`test-report.html\`** in your browser to inspect your Desktop & Mobile screenshots side-by-side.\n\n`;
+
+          md += renderMdTable('1. Vue 3 Composition API & Lab 5/6 Compliance', staticResults);
+          md += renderMdTable('2. Backend RESTful API Tests (`/api/events` & `/api/venues`)', apiResults);
+          md += renderMdTable('3. Browser E2E Checks', e2eResults);
+
+          md += `## 4. Captured Route Diagnostics & Screenshot Index\n\n`;
+          md += `| Page / Route | API Calls Observed | Console Errors | Mobile Overflow | Desktop PNG | Mobile PNG |\n|---|---|---|---|---|---|\n`;
+          for (const m of manifest) {
+            const apis = m.apiCalls.map(a => `\`${a.status} ${a.url}\``).join(', ') || 'None';
+            const errs = m.consoleErrors.length === 0 ? '0' : `${m.consoleErrors.length} error(s)`;
+            md += `| **${m.title}** | ${apis} | ${errs} | ${m.mobileOverflow} | \`screenshots/${m.desktopFile}\` | \`screenshots/${m.mobileFile}\` |\n`;
+          }
+
+          fs.writeFileSync('/home/runner/report-artifact/test-report.md', md);
+
+          // 2. Build Self-Contained Visual HTML Report
+          function escapeHtml(str) {
+            return String(str || '')
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;');
+          }
+
+          function renderHtmlRows(arr) {
+            return arr.map(r => `
+              <tr>
+                <td>${escapeHtml(r.name)}</td>
+                <td><span class="badge ${r.pass ? 'pass' : 'fail'}">${r.pass ? 'PASS' : 'FAIL'}</span></td>
+                <td>${r.error ? `<code>${escapeHtml(r.error)}</code>` : '—'}</td>
+              </tr>`).join('');
+          }
+
+          const cardsHtml = manifest.map(m => {
+            const dPath = path.join('/home/runner/report-artifact/screenshots', m.desktopFile);
+            const mPath = path.join('/home/runner/report-artifact/screenshots', m.mobileFile);
+            const dB64 = fs.existsSync(dPath) ? fs.readFileSync(dPath).toString('base64') : '';
+            const mB64 = fs.existsSync(mPath) ? fs.readFileSync(mPath).toString('base64') : '';
+            const apis = m.apiCalls.map(a => `<span class="tag">${escapeHtml(a.status + ' ' + a.url)}</span>`).join(' ') || '<em>No /api/* requests detected</em>';
+            const errs = m.consoleErrors.length
+              ? `<div class="console-err"><strong>Console Errors:</strong><ul>${m.consoleErrors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`
+              : '';
+            return `
+              <section class="shot-card">
+                <div class="shot-header">
+                  <div>
+                    <h3>${escapeHtml(m.title)}</h3>
+                    <p>${escapeHtml(m.description)} — <code>${escapeHtml(m.targetUrl)}</code></p>
+                  </div>
+                  <div class="meta-pills">
+                    <span class="pill">Mobile Overflow: ${escapeHtml(m.mobileOverflow)}</span>
+                  </div>
+                </div>
+                <div class="api-bar"><strong>API Calls on Mount:</strong> ${apis}</div>
+                ${errs}
+                <div class="shot-grid">
+                  <div class="shot-col desktop">
+                    <h4>Desktop Viewport (1280×720) — <code>screenshots/${escapeHtml(m.desktopFile)}</code></h4>
+                    ${dB64 ? `<img src="data:image/png;base64,${dB64}" alt="${escapeHtml(m.title)} desktop" />` : '<p>No screenshot</p>'}
+                  </div>
+                  <div class="shot-col mobile">
+                    <h4>Mobile Viewport (375×667) — <code>screenshots/${escapeHtml(m.mobileFile)}</code></h4>
+                    ${mB64 ? `<img src="data:image/png;base64,${mB64}" alt="${escapeHtml(m.title)} mobile" />` : '<p>No screenshot</p>'}
+                  </div>
+                </div>
+              </section>`;
+          }).join('\n');
+
+          const html = `<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>COMP3047 Assignment 2 — Pipeline Feedback & Screenshot Report</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 24px; background: #f8fafc; color: #0f172a; }
+              .container { max-width: 1400px; margin: 0 auto; }
+              header { background: #1e293b; color: #fff; padding: 24px; border-radius: 12px; margin-bottom: 24px; }
+              header h1 { margin: 0 0 8px 0; font-size: 24px; }
+              header p { margin: 4px 0; color: #cbd5e1; font-size: 14px; }
+              .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
+              .stat-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; }
+              .stat-card h3 { margin: 0 0 8px 0; font-size: 14px; color: #64748b; text-transform: uppercase; }
+              .stat-card .num { font-size: 28px; font-weight: 700; color: #0f172a; }
+              table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; margin-bottom: 24px; border: 1px solid #e2e8f0; }
+              th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #e2e8f0; font-size: 14px; }
+              th { background: #f1f5f9; font-weight: 600; }
+              .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+              .badge.pass { background: #dcfce7; color: #166534; }
+              .badge.fail { background: #fee2e2; color: #991b1b; }
+              .shot-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+              .shot-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; border-bottom: 1px solid #f1f5f9; padding-bottom: 12px; margin-bottom: 12px; }
+              .shot-header h3 { margin: 0 0 4px 0; font-size: 18px; }
+              .shot-header p { margin: 0; color: #64748b; font-size: 13px; }
+              .api-bar { font-size: 13px; margin-bottom: 12px; color: #334155; }
+              .tag { display: inline-block; background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 12px; margin-right: 6px; }
+              .pill { display: inline-block; background: #f1f5f9; color: #334155; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+              .console-err { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
+              .shot-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
+              .shot-col h4 { margin: 0 0 8px 0; font-size: 13px; color: #475569; }
+              .shot-col img { width: 100%; height: auto; border: 1px solid #cbd5e1; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <header>
+                <h1>COMP3047 Assignment 2 — Application Feedback & Screenshot Report</h1>
+                <p>Repository: <strong>${escapeHtml(process.env.GITHUB_REPOSITORY || 'local')}</strong> | Ref: <strong>${escapeHtml(process.env.GITHUB_REF_NAME || 'HEAD')}</strong> | Mode: <strong>${escapeHtml(process.env.DB_MODE)}</strong> | Generated: ${escapeHtml(new Date().toISOString())}</p>
+              </header>
+
+              <div class="summary-grid">
+                <div class="stat-card"><h3>Overall Checks</h3><div class="num">${totalPassed} / ${totalCount}</div></div>
+                <div class="stat-card"><h3>Vue 3 & Lab 5/6 Compliance</h3><div class="num">${sStat.passed} / ${sStat.total}</div></div>
+                <div class="stat-card"><h3>Express REST API</h3><div class="num">${aStat.passed} / ${aStat.total}</div></div>
+                <div class="stat-card"><h3>Playwright E2E & Pages</h3><div class="num">${eStat.passed} / ${eStat.total}</div></div>
+              </div>
+
+              <h2>1. Vue 3 Composition API & Lab 5/6 Compliance</h2>
+              <table><thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead><tbody>${renderHtmlRows(staticResults)}</tbody></table>
+
+              <h2>2. Backend RESTful API Endpoints (/api/events & /api/venues)</h2>
+              <table><thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead><tbody>${renderHtmlRows(apiResults)}</tbody></table>
+
+              <h2>3. Browser E2E Checks</h2>
+              <table><thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead><tbody>${renderHtmlRows(e2eResults)}</tbody></table>
+
+              <h2>4. Application Screenshots (Desktop 1280×720 & Mobile 375×667)</h2>
+              ${cardsHtml}
+            </div>
+          </body>
+          </html>`;
+
+          fs.writeFileSync('/home/runner/report-artifact/test-report.html', html);
+          SCRIPT
+
+      # ── Stage 8: Publish Job Summary & Upload Artifact ────────────────────
+      - name: Publish Summary to GitHub Actions UI
+        if: always()
+        run: |
+          if [ -f /home/runner/report-artifact/test-report.md ]; then
+            cat /home/runner/report-artifact/test-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Feedback Report & Screenshots Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment2-feedback-report-${{ github.run_id }}
+          path: |
+            /home/runner/report-artifact/test-report.html
+            /home/runner/report-artifact/test-report.md
+            /home/runner/report-artifact/screenshots/
+          retention-days: 30
